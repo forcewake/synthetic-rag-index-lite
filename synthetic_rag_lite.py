@@ -1,0 +1,1252 @@
+#\!/usr/bin/env python3
+# Synthetic RAG Lite
+# A lightweight tool for synthesizing markdown and image content into indexed facts
+
+import asyncio
+import json
+import os
+import re
+import argparse
+import hashlib
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, TypeVar, Callable
+from datetime import datetime
+from dataclasses import dataclass, field, asdict
+from enum import Enum, auto
+import shutil
+
+from tools.logging import logger
+
+from tools.file import detect_extension, has_excessive_repetition, hash_text, sanitize_text
+
+# Import dotenv for loading environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    HAS_DOTENV = True
+except ImportError:
+    HAS_DOTENV = False
+
+# Optional image processing
+try:
+    from PIL import Image
+    import pytesseract
+    HAS_IMAGE_PROCESSING = True
+except ImportError:
+    HAS_IMAGE_PROCESSING = False
+
+# Import LiteLLM for unified LLM access
+try:
+    import litellm
+    from litellm import completion, acompletion
+    HAS_LITELLM = True
+except ImportError:
+    HAS_LITELLM = False
+
+# Custom types
+T = TypeVar("T")
+
+# Directory structure constants
+RAW_FOLDER = "raw"
+SANITIZE_FOLDER = "0-sanitize"
+EXTRACT_FOLDER = "1-extract"
+CHUNCK_FOLDER = "2-chunck"
+SYNTHESIS_FOLDER = "3-synthesis"
+PAGE_FOLDER = "4-page"
+FACT_FOLDER = "5-fact"
+CRITIC_FOLDER = "6-critic"
+INDEX_FOLDER = "7-index"
+
+class LLMProvider(Enum):
+    OPENAI = "openai"
+    AZURE = "azure"
+    ANTHROPIC = "anthropic"
+    COHERE = "cohere"
+    OLLAMA = "ollama"
+    TOGETHER = "together"
+    VERTEX = "vertex"
+    BEDROCK = "bedrock"
+    CUSTOM = "custom"
+
+class OutputFormat(Enum):
+    """Output format options."""
+    JSON = "json"          # Original JSON format
+    JSONL = "jsonl"        # JSON Lines format
+    MARKDOWN = "markdown"  # Markdown format
+    ALL = "all"            # Output all formats
+    
+@dataclass
+class Config:
+    """Configuration for the synthetic RAG system"""
+    version: str = "0.1.0"
+    
+    # Feature configs
+    chunck_size: int = 4000  # Characters per chunk
+    page_split_size: int = 1500  # Characters per page
+    fact_iterations: int = 5  # Number of fact generation iterations
+    fact_score_threshold: float = 0.7  # Minimum score for facts to be kept
+    repetition_threshold: float = 1.5  # Threshold for detecting excessive repetition
+    
+    # LiteLLM configuration
+    llm_provider: LLMProvider = LLMProvider.OPENAI
+    llm_model_fast: str = "gpt-4o-mini"  # Faster, cheaper model for routine tasks
+    llm_model_quality: str = "gpt-4o"  # Higher quality model for synthesis/critique
+    
+    # Provider-specific configurations
+    # Azure OpenAI
+    azure_api_base: Optional[str] = None
+    azure_api_version: str = "2023-07-01-preview"
+    azure_deployment_name: Optional[str] = None
+    
+    # Anthropic
+    anthropic_api_key: Optional[str] = None
+    
+    # Ollama
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "llama3"
+    
+    # LiteLLM API proxy
+    litellm_proxy_url: Optional[str] = None
+    litellm_proxy_key: Optional[str] = None
+    
+    # LiteLLM fallbacks configuration
+    use_fallbacks: bool = False
+    fallback_models: List[str] = field(default_factory=list)
+    
+    # Directory configuration
+    input_dir: Path = Path("input")
+    output_dir: Path = Path("output")
+    
+    # Output format configuration
+    fact_output_format: OutputFormat = OutputFormat.JSON
+    critic_output_format: OutputFormat = OutputFormat.JSON
+    index_output_format: OutputFormat = OutputFormat.JSON
+
+# Global config instance
+CONFIG = Config()
+
+# ========== Data Models ==========
+
+@dataclass
+class ExtractedDocumentModel:
+    """Model for extracted document content"""
+    document_content: str
+    file_md5: str
+    file_path: str
+    format: str
+    langs: List[str] = field(default_factory=list)
+    title: Optional[str] = None
+
+@dataclass
+class ChunkedDocumentModel:
+    """Model for chunked document content"""
+    chunk_content: str
+    chunk_number: int
+    file_md5: str
+    file_path: str
+    format: str
+    langs: List[str] = field(default_factory=list)
+    title: Optional[str] = None
+
+@dataclass
+class SynthetisedDocumentModel:
+    """Model for synthesized document content"""
+    chunk_content: str
+    chunk_number: int
+    file_md5: str
+    file_path: str
+    format: str
+    synthesis: str
+    langs: List[str] = field(default_factory=list)
+    title: Optional[str] = None
+
+@dataclass
+class PagedDocumentModel:
+    """Model for paged document content"""
+    chunk_content: str
+    chunk_number: int
+    file_md5: str
+    file_path: str
+    format: str
+    page_content: str
+    page_number: int
+    synthesis: str
+    langs: List[str] = field(default_factory=list)
+    title: Optional[str] = None
+
+@dataclass
+class FactModel:
+    """Model for a single fact extracted from a document"""
+    question: str
+    answer: str
+    context: str
+
+@dataclass
+class FactedLlmModel:
+    """Model for facts generated by LLM"""
+    facts: List[FactModel] = field(default_factory=list)
+
+@dataclass
+class FactedDocumentModel:
+    """Model for document with extracted facts"""
+    chunk_content: str
+    chunk_number: int
+    facts: List[FactModel]
+    file_md5: str
+    file_path: str
+    format: str
+    page_content: str
+    page_number: int
+    synthesis: str
+    langs: List[str] = field(default_factory=list)
+    title: Optional[str] = None
+
+@dataclass
+class IndexedDocumentModel:
+    """Model for indexed document"""
+    answer: str
+    context: str
+    document_synthesis: str
+    file_path: str
+    id: str
+    question: str
+
+def ensure_directory(directory: Path) -> None:
+    """Ensure a directory exists."""
+    directory.mkdir(parents=True, exist_ok=True)
+
+def get_file_md5(file_path: Path) -> str:
+    """Get MD5 hash of a file."""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def save_as_json(data: Any, path: Path) -> None:
+    """Save data as pretty JSON."""
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    logger.info(f"Saved JSON: {path}")
+
+def save_as_jsonl(data: Any, path: Path) -> None:
+    """Save data as JSON Lines format."""
+    with open(path, 'w', encoding='utf-8') as f:
+        if isinstance(data, list):
+            for item in data:
+                f.write(json.dumps(item) + '\n')
+        else:
+            f.write(json.dumps(data) + '\n')
+    logger.info(f"Saved JSONL: {path}")
+
+def save_as_markdown(data: Any, path: Path) -> None:
+    """Save data as Markdown format."""
+    with open(path, 'w', encoding='utf-8') as f:
+        if isinstance(data, dict):
+            # Handle document models converted to dict
+            if "facts" in data and isinstance(data["facts"], list):
+                f.write(f"# Facts from {data.get('file_path', 'Unknown')}\n\n")
+                
+                # Include document information
+                f.write("## Document Information\n\n")
+                if data.get("title"):
+                    f.write(f"**Title:** {data.get('title')}\n\n")
+                if data.get("format"):
+                    f.write(f"**Format:** {data.get('format')}\n\n")
+                if data.get("langs") and data.get("langs"):
+                    f.write(f"**Languages:** {', '.join(data.get('langs'))}\n\n")
+                
+                # Include original content 
+                f.write("## Original Content\n\n")
+                f.write(f"```\n{data.get('page_content', 'No content available')}\n```\n\n")
+                
+                # Include synthesis
+                f.write("## Synthesis\n\n")
+                f.write(f"{data.get('synthesis', 'No synthesis available')}\n\n")
+                
+                # Include facts
+                f.write("## Facts\n\n")
+                for i, fact in enumerate(data["facts"], 1):
+                    f.write(f"### Fact {i}\n\n")
+                    f.write(f"**Question:** {fact.get('question', 'N/A')}\n\n")
+                    f.write(f"**Answer:** {fact.get('answer', 'N/A')}\n\n")
+                    f.write(f"**Context:** {fact.get('context', 'N/A')}\n\n")
+                    f.write("---\n\n")
+            elif "question" in data and "answer" in data:
+                # Handle indexed document models
+                f.write(f"# {data.get('question', 'Question')}\n\n")
+                f.write(f"{data.get('answer', 'No answer provided')}\n\n")
+                
+                if "context" in data:
+                    f.write(f"**Context:** {data.get('context', '')}\n\n")
+                
+                if "document_synthesis" in data:
+                    f.write(f"**Document Summary:** {data.get('document_synthesis', '')}\n\n")
+                
+                if "file_path" in data:
+                    f.write(f"**Source:** {data.get('file_path', '')}\n\n")
+            else:
+                # Generic object
+                for key, value in data.items():
+                    f.write(f"## {key}\n\n")
+                    f.write(f"{value}\n\n")
+        else:
+            # Just convert to string if not a structured object
+            f.write(str(data))
+    logger.info(f"Saved Markdown: {path}")
+
+def save_with_format(data: Any, base_path: Path, format: OutputFormat) -> None:
+    """Save data in the specified format(s)."""
+    # Get the base parts
+    path_stem = base_path.stem
+    path_parent = base_path.parent
+    
+    if format == OutputFormat.JSON or format == OutputFormat.ALL:
+        json_path = path_parent / f"{path_stem}.json"
+        save_as_json(data, json_path)
+    
+    if format == OutputFormat.JSONL or format == OutputFormat.ALL:
+        jsonl_path = path_parent / f"{path_stem}.jsonl"
+        save_as_jsonl(data, jsonl_path)
+    
+    if format == OutputFormat.MARKDOWN or format == OutputFormat.ALL:
+        md_path = path_parent / f"{path_stem}.md"
+        save_as_markdown(data, md_path)
+
+# ========== LLM Client ==========
+
+class LLMClient:
+    """Client for interacting with LLM models via LiteLLM."""
+    
+    def __init__(self, is_fast: bool = True):
+        """
+        Initialize LLM client with either fast or quality model.
+        
+        Args:
+            is_fast: If True, use the faster model specified in config; otherwise use quality model.
+        """
+        if not HAS_LITELLM:
+            raise ImportError("LiteLLM package is required. Install it with: pip install litellm")
+        
+        self.is_fast = is_fast
+        self.model = self._get_model_name()
+        
+        # Configure LiteLLM based on provider
+        self._configure_litellm()
+    
+    def _get_model_name(self) -> str:
+        """Get the appropriate model name based on speed preference and provider."""
+        base_model = CONFIG.llm_model_fast if self.is_fast else CONFIG.llm_model_quality
+        
+        # For certain providers, we need to modify the model string
+        if CONFIG.llm_provider == LLMProvider.AZURE and CONFIG.azure_deployment_name:
+            return f"azure/{CONFIG.azure_deployment_name}"
+        elif CONFIG.llm_provider == LLMProvider.OLLAMA:
+            return f"ollama/{CONFIG.ollama_model}"
+        elif CONFIG.llm_provider == LLMProvider.VERTEX:
+            return f"vertex_ai/{base_model}"
+        elif CONFIG.llm_provider == LLMProvider.BEDROCK:
+            return f"bedrock/{base_model}"
+        
+        # For OpenAI, Anthropic, Cohere, etc. use the model name as is
+        return base_model
+    
+    def _configure_litellm(self):
+        """Configure LiteLLM settings based on the selected provider."""
+        # Set provider-specific configurations
+        if CONFIG.llm_provider == LLMProvider.AZURE and CONFIG.azure_api_base:
+            litellm.api_base = CONFIG.azure_api_base
+            litellm.api_version = CONFIG.azure_api_version
+        
+        elif CONFIG.llm_provider == LLMProvider.OLLAMA:
+            # Set Ollama base URL
+            litellm.set_verbose = True
+            litellm.ollama_api_base = CONFIG.ollama_base_url
+        
+        # Configure LiteLLM proxy if specified
+        if CONFIG.litellm_proxy_url:
+            litellm.api_base = CONFIG.litellm_proxy_url
+            
+            # Set proxy API key if provided in config
+            if CONFIG.litellm_proxy_key:
+                litellm.api_key = CONFIG.litellm_proxy_key
+            else:
+                # Try to get proxy key from environment variables
+                proxy_key = os.environ.get("LITELLM_PROXY_KEY")
+                if proxy_key:
+                    litellm.api_key = proxy_key
+                    # Save to config for consistent reference
+                    CONFIG.litellm_proxy_key = proxy_key
+            
+            # When using proxy, we use the model name as is
+            self.model = CONFIG.llm_model_fast if self.is_fast else CONFIG.llm_model_quality
+        
+        # Configure fallbacks if enabled
+        if CONFIG.use_fallbacks and CONFIG.fallback_models:
+            litellm.set_fallbacks(CONFIG.fallback_models)
+    
+    async def generate(
+        self, 
+        prompt: str, 
+        res_type: Any = str,
+        temperature: float = 0.7, 
+        max_tokens: int = 2000,
+        validate_json: bool = False,
+        validation_callback: Optional[Callable] = None
+    ) -> Any:
+        """
+        Generate text from prompt using the configured LLM via LiteLLM.
+        
+        Args:
+            prompt: The input prompt text
+            res_type: The expected return type
+            temperature: Controls randomness (0.0 to 1.0)
+            max_tokens: Maximum tokens in the response
+            validate_json: Whether to enforce JSON response
+            validation_callback: Function to validate and process the response
+            
+        Returns:
+            The generated text or processed result based on validation callback
+        """
+        try:
+            # Prepare messages in the chat format
+            messages = [{"role": "user", "content": prompt}]
+            
+            # Call LiteLLM's async completion
+            response = await acompletion(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format={"type": "json_object"} if validate_json else None
+            )
+            
+            # Extract the generated text
+            text = response.choices[0].message.content
+            
+            # Validate and process response if needed
+            if validation_callback:
+                is_valid, error, processed = validation_callback(text)
+                if not is_valid:
+                    logger.warning(f"Validation failed: {error}")
+                    return None
+                return processed
+            
+            return text
+            
+        except Exception as e:
+            logger.error(f"Error generating text with LiteLLM: {e}")
+            if validation_callback:
+                return None
+            return f"Error: {str(e)}"
+    
+    def chunck(self, text: str, max_tokens: int = None) -> List[str]:
+        """
+        Split text into chunks with specified max token count.
+        
+        Args:
+            text: The input text to chunk
+            max_tokens: Maximum tokens per chunk (defaults to config setting)
+            
+        Returns:
+            List of text chunks
+        """
+        if not max_tokens:
+            max_tokens = CONFIG.chunck_size
+            
+        # Simple splitting by character count (approximation)
+        avg_chars_per_token = 4  # Rough estimate
+        max_chars = max_tokens * avg_chars_per_token
+        
+        # Split text into paragraphs
+        paragraphs = text.split('\n\n')
+        
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        for paragraph in paragraphs:
+            paragraph_size = len(paragraph)
+            
+            if current_size + paragraph_size <= max_chars:
+                current_chunk.append(paragraph)
+                current_size += paragraph_size
+            else:
+                if current_chunk:
+                    chunks.append('\n\n'.join(current_chunk))
+                current_chunk = [paragraph]
+                current_size = paragraph_size
+        
+        if current_chunk:
+            chunks.append('\n\n'.join(current_chunk))
+            
+        return chunks
+
+# ========== Document Processor ==========
+
+class DocumentProcessor:
+    """Process documents for RAG."""
+    
+    def __init__(self, config: Config):
+        """Initialize with configuration."""
+        self.config = config
+        
+    @staticmethod
+    def compatible_formats() -> set:
+        """Get set of compatible file formats."""
+        formats = {'.md', '.txt'}
+        if HAS_IMAGE_PROCESSING:
+            formats.update({'.jpg', '.jpeg', '.png', '.gif', '.bmp'})
+        return formats
+    
+    def extract_text_from_image(self, image_path: Path) -> str:
+        """Extract text from image using OCR."""
+        if not HAS_IMAGE_PROCESSING:
+            logger.warning("Image processing libraries not installed, skipping OCR")
+            return ""
+        
+        try:
+            img = Image.open(image_path)
+            text = pytesseract.image_to_string(img)
+            return text
+        except Exception as e:
+            logger.error(f"Error extracting text from image: {e}")
+            return ""
+    
+    async def analyze(self, file_path: Path) -> Tuple[str, Optional[str], List[str]]:
+        """Analyze document and extract content, title and languages."""
+        extension = detect_extension(str(file_path))
+        content = ""
+        title = None
+        langs = ["en"]  # Default to English
+        
+        try:
+            if extension in {'.md', '.txt'}:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Try to extract title from markdown
+                if extension == '.md':
+                    title_match = re.search(r'^#\s+(.+)$', content, re.MULTILINE)
+                    if title_match:
+                        title = title_match.group(1)
+                
+            elif HAS_IMAGE_PROCESSING and extension in {'.jpg', '.jpeg', '.png', '.gif', '.bmp'}:
+                content = self.extract_text_from_image(file_path)
+                # Use filename as title for images
+                title = file_path.stem
+            
+            # Clean content
+            content = sanitize_text(content)
+            
+            return content, title, langs
+        except Exception as e:
+            logger.error(f"Error analyzing document: {e}")
+            return "", None, []
+
+# ========== Index Client ==========
+
+class IndexClient:
+    """Client for indexing documents."""
+    
+    def __init__(self, config: Config):
+        """Initialize with configuration."""
+        self.config = config
+        self.index_dir = config.output_dir / INDEX_FOLDER
+        ensure_directory(self.index_dir)
+    
+    async def index(self, documents: List[IndexedDocumentModel]) -> None:
+        """Index documents to local storage."""
+        for doc in documents:
+            # Create document file in the selected format(s)
+            doc_base_path = self.index_dir / f"{doc.id}"
+            save_with_format(asdict(doc), doc_base_path, self.config.index_output_format)
+            
+            # Log for the primary JSON format (for backward compatibility)
+            doc_path = doc_base_path.with_suffix(".json")
+            logger.info(f"Indexed document: {doc_path}")
+
+# ========== Processing Pipeline ==========
+
+class ProcessingPipeline:
+    """Main processing pipeline for synthetic RAG."""
+    
+    def __init__(self, config: Config):
+        """Initialize pipeline with configuration."""
+        self.config = config
+        self.doc_processor = DocumentProcessor(config)
+        self.index_client = IndexClient(config)
+        
+        # Ensure all directories exist
+        for folder in [
+            RAW_FOLDER, SANITIZE_FOLDER, EXTRACT_FOLDER, CHUNCK_FOLDER,
+            SYNTHESIS_FOLDER, PAGE_FOLDER, FACT_FOLDER, CRITIC_FOLDER, INDEX_FOLDER
+        ]:
+            ensure_directory(config.output_dir / folder)
+    
+    async def process_file(self, file_path: Path) -> None:
+        """Process a single file through the pipeline."""
+        logger.info(f"Processing file: {file_path}")
+        
+        # Copy to raw folder
+        raw_path = self.config.output_dir / RAW_FOLDER / file_path.name
+        shutil.copy2(file_path, raw_path)
+        
+        # Get file MD5
+        file_md5 = get_file_md5(file_path)
+        
+        # Step 1: Extract
+        await self.extract_content(raw_path, file_md5)
+    
+    async def extract_content(self, file_path: Path, file_md5: str) -> None:
+        """Extract content from document."""
+        # Sanitize first (copy file to sanitize folder)
+        sanitize_path = self.config.output_dir / SANITIZE_FOLDER / file_path.name
+        shutil.copy2(file_path, sanitize_path)
+        
+        # Extract content
+        content, title, langs = await self.doc_processor.analyze(sanitize_path)
+        
+        if not content:
+            logger.warning(f"No content extracted from: {file_path}")
+            return
+        
+        # Build model
+        extract_model = ExtractedDocumentModel(
+            document_content=content,
+            file_md5=file_md5,
+            file_path=str(file_path),
+            format="markdown" if file_path.suffix == ".md" else "text",
+            langs=langs,
+            title=title
+        )
+        
+        # Save extracted content
+        extract_path = self.config.output_dir / EXTRACT_FOLDER / f"{file_md5}.json"
+        with open(extract_path, 'w', encoding='utf-8') as f:
+            json.dump(asdict(extract_model), f, indent=2)
+            
+        logger.info(f"Extracted content saved to: {extract_path}")
+        
+        # Continue to next step
+        await self.chunk_content(extract_path, extract_model)
+    
+    async def chunk_content(self, extract_path: Path, extract_model: ExtractedDocumentModel) -> None:
+        """Chunk document content into smaller parts."""
+        # Create LLM client
+        llm_client = LLMClient(is_fast=False)
+        
+        # Split content into chunks
+        chunks = llm_client.chunck(text=extract_model.document_content)
+        logger.info(f"Split into {len(chunks)} chunks: {extract_path}")
+        
+        for i, chunk in enumerate(chunks):
+            # Build model
+            chunk_model = ChunkedDocumentModel(
+                chunk_content=chunk,
+                chunk_number=i,
+                file_md5=extract_model.file_md5,
+                file_path=extract_model.file_path,
+                format=extract_model.format,
+                langs=extract_model.langs,
+                title=extract_model.title
+            )
+            
+            # Save chunk
+            chunk_path = self.config.output_dir / CHUNCK_FOLDER / f"{extract_model.file_md5}-{i}.json"
+            with open(chunk_path, 'w', encoding='utf-8') as f:
+                json.dump(asdict(chunk_model), f, indent=2)
+                
+            logger.info(f"Saved chunk {i+1}/{len(chunks)}: {chunk_path}")
+            
+            # Continue to next step
+            await self.synthesize_content(chunk_path, chunk_model)
+    
+    async def synthesize_content(self, chunk_path: Path, chunk_model: ChunkedDocumentModel) -> None:
+        """Synthesize chunk content."""
+        # Create LLM client for synthesis (using quality model)
+        llm_client = LLMClient(is_fast=False)
+        
+        # Validation callback for synthesis
+        def validate_synthesis(res: Optional[str]) -> Tuple[bool, Optional[str], Optional[str]]:
+            if not res:
+                return False, "Empty response", None
+            res = res.strip()
+            if len(res) < 10:  # Arbitrary minimum length
+                return False, "Response too short", None
+            return True, None, res
+        
+        # Generate synthesis
+        synthesis = await llm_client.generate(
+            max_tokens=500,  # 500 tokens ~= 375 words
+            res_type=str,
+            validation_callback=validate_synthesis,
+            prompt=f"""
+            Assistant is an expert data analyst with 20 years of experience.
+
+            # Objective
+            Synthesise the document. Content come from a chunked document created with an OCR tool, it may contain errors, repetitions, or missing parts, do your best to understand it.
+
+            # Rules
+            - Answer only with the synthesis, nothing else
+            - Answers in English, even if the document is in another language
+            - Be concise
+            - Outline the main points but not the details
+            - Use only the information provided in the document
+
+            # Document metadata
+            - Format: {chunk_model.format}
+            - Lang: {", ".join(chunk_model.langs) if chunk_model.langs else "N/A"}
+            - Title: {chunk_model.title if chunk_model.title else "N/A"}
+
+            # Response format
+            [synthesis, single paragraph]
+
+            ## Example 1
+            Content: Regulatory context. Scientific publications are unequivocal about the urgent challenges posed by climate change and the need for a transition to a climate-neutral economy. The International Energy Agency (IEA) asserts, in its Net Zero Emissions (NZE) scenario, that achieving carbon neutrality by 2050 and limiting warming to 1.5℃ by the end of the century requires an immediate end to all new fossil fuel exploration projects.
+            Synthesis: This document addresses the urgent challenges posed by climate change and the need for a transition to a climate-neutral economy. Drafted by the International Energy Agency (IEA), the "Net Zero Emissions" (NZE) program aims to achieve carbon neutrality and limit global warming.
+
+            ## Example 2
+            Content: Life insurance fees: In order to increase the transparency of fees on these contracts, Gan Vie undertakes to update the information below on an annual basis. Last update September 01, 2023. Introductory remarks: contract management fees correspond to fees deducted directly by the insurer from the assets in Units of Account or in Euros. Additional fees may be charged depending on the management method chosen.
+            Synthesis: Gan Vie undertakes to update information on life insurance fees annually. Fees are billed directly by the insurer, and additional fees may apply.
+
+            # Document content
+            {chunk_model.chunk_content}
+            """
+        )
+        
+        if not synthesis:
+            logger.warning(f"Failed to generate synthesis: {chunk_path}")
+            return
+        
+        # Build model
+        synthesis_model = SynthetisedDocumentModel(
+            chunk_content=chunk_model.chunk_content,
+            chunk_number=chunk_model.chunk_number,
+            file_md5=chunk_model.file_md5,
+            file_path=chunk_model.file_path,
+            format=chunk_model.format,
+            langs=chunk_model.langs,
+            synthesis=synthesis,
+            title=chunk_model.title
+        )
+        
+        # Save synthesis
+        synthesis_path = self.config.output_dir / SYNTHESIS_FOLDER / f"{chunk_model.file_md5}-{chunk_model.chunk_number}.json"
+        with open(synthesis_path, 'w', encoding='utf-8') as f:
+            json.dump(asdict(synthesis_model), f, indent=2)
+            
+        logger.info(f"Generated synthesis: {synthesis_path}")
+        
+        # Continue to next step
+        await self.page_content(synthesis_path, synthesis_model)
+    
+    async def page_content(self, synthesis_path: Path, synthesis_model: SynthetisedDocumentModel) -> None:
+        """Split content into pages."""
+        # Create LLM client (using fast model for pages)
+        llm_client = LLMClient(is_fast=True)
+        
+        # Split content into pages
+        pages = llm_client.chunck(
+            max_tokens=CONFIG.page_split_size,
+            text=synthesis_model.chunk_content
+        )
+        logger.info(f"Split into {len(pages)} pages: {synthesis_path}")
+        
+        for i, page in enumerate(pages):
+            # Filter-out pages with excessive repetition
+            if has_excessive_repetition(
+                text=page,
+                threshold_ratio=CONFIG.repetition_threshold,
+            ):
+                logger.warning(f"Repetition detected, skipping ({synthesis_model.file_path})")
+                continue
+            
+            # Build model
+            page_model = PagedDocumentModel(
+                chunk_content=synthesis_model.chunk_content,
+                chunk_number=synthesis_model.chunk_number,
+                file_md5=synthesis_model.file_md5,
+                file_path=synthesis_model.file_path,
+                format=synthesis_model.format,
+                langs=synthesis_model.langs,
+                page_content=page,
+                page_number=i,
+                synthesis=synthesis_model.synthesis,
+                title=synthesis_model.title
+            )
+            
+            # Save page
+            page_path = self.config.output_dir / PAGE_FOLDER / f"{synthesis_model.file_md5}-{synthesis_model.chunk_number}-{i}.json"
+            with open(page_path, 'w', encoding='utf-8') as f:
+                json.dump(asdict(page_model), f, indent=2)
+                
+            logger.info(f"Saved page {i+1}/{len(pages)}: {page_path}")
+            
+            # Continue to next step
+            await self.generate_facts(page_path, page_model)
+    
+    async def generate_facts(self, page_path: Path, page_model: PagedDocumentModel) -> None:
+        """Generate facts from page content."""
+        # Create LLM client (using fast model for facts)
+        llm_client = LLMClient(is_fast=True)
+        
+        facts: List[FactModel] = []
+        
+        for _ in range(CONFIG.fact_iterations):
+            # Validation callback for facts
+            def validate_facts(req: Optional[str]) -> Tuple[bool, Optional[str], Optional[FactedLlmModel]]:
+                if not req:
+                    return False, "Empty response", None
+                try:
+                    # Try to parse as JSON
+                    data = json.loads(req)
+                    
+                    # Validate structure
+                    if not isinstance(data, dict) or "facts" not in data:
+                        return False, "Invalid JSON structure", None
+                    
+                    # Create model
+                    facts_list = []
+                    for fact in data["facts"]:
+                        if all(k in fact for k in ["question", "answer", "context"]):
+                            facts_list.append(FactModel(
+                                question=fact["question"],
+                                answer=fact["answer"],
+                                context=fact["context"]
+                            ))
+                    
+                    return True, None, FactedLlmModel(facts=facts_list)
+                except Exception as e:
+                    return False, str(e), None
+            
+            facted_llm_model = await llm_client.generate(
+                res_type=FactedLlmModel,
+                temperature=1,  # We want creative answers
+                validate_json=True,
+                validation_callback=validate_facts,
+                prompt=f"""
+                Assistant is an expert data analyst with 20 years of experience.
+
+                # Objective
+                Create new question/answer pairs for a document. Content come from a paged document created with an OCR tool, it may contain errors, repetitions, or missing parts, do your best to understand it.
+
+                # Rules
+                - Answers in English, even if the document is in another language
+                - Be concise
+                - New facts must be on different points than the ones already generated
+                - Only use the information provided in the document
+
+                # Document metadata
+                - Format: {page_model.format}
+                - Lang: {", ".join(page_model.langs) if page_model.langs else "N/A"}
+                - Title: {page_model.title or "N/A"}
+
+                # Document synthesis
+                {page_model.synthesis}
+
+                # Document content
+                {page_model.page_content}
+
+                # Facts already generated
+                {json.dumps(asdict(FactedLlmModel(facts=facts))) if facts else "N/A"}
+
+                # Response format (JSON)
+                {{
+                  "facts": [
+                    {{
+                      "question": "What is the question?",
+                      "answer": "This is the answer",
+                      "context": "This is the context for the question and answer"
+                    }}
+                  ]
+                }}
+
+                ## Example 1
+                Synthesis: This document addresses the demographic challenges faced by the country. The population is aging, and the birth rate is declining. The government has implemented policies to address these issues.
+                Content: The mayor of the Parisian district of Montmartre has announced a new initiative to address the demographic issues. This is a first step for the capital.
+                Response: 
+                {{
+                  "facts": [
+                    {{
+                      "question": "What is the capital of France?",
+                      "answer": "Paris",
+                      "context": "Paris, as the capital of France, is the political, economic, and cultural center of the country."
+                    }}
+                  ]
+                }}
+                """
+            )
+            
+            if facted_llm_model and facted_llm_model.facts:
+                facts.extend(facted_llm_model.facts)
+        
+        if not facts:
+            logger.info(f"No facts detected, skipping: {page_path}")
+            return
+            
+        logger.info(f"Generated {len(facts)} facts: {page_path}")
+        
+        # Build model
+        fact_model = FactedDocumentModel(
+            chunk_content=page_model.chunk_content,
+            chunk_number=page_model.chunk_number,
+            facts=facts,
+            file_md5=page_model.file_md5,
+            file_path=page_model.file_path,
+            format=page_model.format,
+            langs=page_model.langs,
+            page_content=page_model.page_content,
+            page_number=page_model.page_number,
+            synthesis=page_model.synthesis,
+            title=page_model.title
+        )
+        
+        # Save facts in the selected format(s)
+        fact_base_path = self.config.output_dir / FACT_FOLDER / f"{page_model.file_md5}-{page_model.chunk_number}-{page_model.page_number}"
+        save_with_format(asdict(fact_model), fact_base_path, CONFIG.fact_output_format)
+        
+        # Convert to standard .json path for backwards compatibility
+        fact_path = fact_base_path.with_suffix(".json")
+        
+        # Continue to next step
+        await self.critique_facts(fact_path, fact_model)
+    
+    async def critique_facts(self, fact_path: Path, fact_model: FactedDocumentModel) -> None:
+        """Critique and filter facts based on quality."""
+        # Create LLM client (using quality model for critique)
+        llm_client = LLMClient(is_fast=False)
+        
+        # Number of facts before filtering
+        initial_fact_count = len(fact_model.facts)
+        
+        # Score validation callback
+        def validate_score(req: Optional[str]) -> Tuple[bool, Optional[str], Optional[float]]:
+            if not req:
+                return False, "Empty response", None
+            req = req.strip()
+            try:
+                return True, None, float(req)
+            except ValueError:
+                # Try to extract a float from the text
+                group = re.search(r"\d+\.\d+", req)
+                if group:
+                    return True, None, float(group.group())
+                return False, "Score not detected", None
+        
+        # Score each fact
+        fact_scores = []
+        for fact in fact_model.facts:
+            score = await llm_client.generate(
+                max_tokens=10,  # We only need a float score
+                res_type=float,
+                validation_callback=validate_score,
+                prompt=f"""
+                Assistant is an expert data analyst with 20 years of experience.
+
+                # Objective
+                Evaluate the quality of a fact. The fact is a question/answer pair created from a paged document.
+
+                # Rules
+                - Answer only with the score, nothing else
+                - High scores indicate that the fact is likely to be correct and relevant
+                - Low scores indicate that the fact is likely to be incorrect or irrelevant
+                - Only use the information provided in the document
+                - The score should reflect the quality of the fact based on the document synthesis, page content, and context
+
+                # Document metadata
+                - Format: {fact_model.format}
+                - Lang: {", ".join(fact_model.langs) if fact_model.langs else "N/A"}
+                - Title: {fact_model.title or "N/A"}
+
+                # Document synthesis
+                {fact_model.synthesis}
+
+                # Page content
+                {fact_model.page_content}
+
+                # Response format
+                [score, a float between 0.0 and 1.0]
+
+                ## Example 1
+                Question: What is the capital of France?
+                Answer: Paris
+                Context: Paris, as the capital of France, is the political, economic, and cultural center of the country.
+                Assistant: 1.0
+
+                ## Example 2
+                Question: What is the ISIN code for the stock?
+                Answer: US0378331005
+                Context: The ISIN code for the stock is FR0000120172.
+                Assistant: 0.0
+
+                ## Example 3
+                Question: In which year was the company founded?
+                Answer: 1939
+                Context: The company, by its founder, was established during World War II to provide essential services to the population. Its exact founding date is unknown.
+                Assistant: 0.6
+
+                ## Example 4
+                Question: What is the main product of the company?
+                Answer: A software suite
+                Context: The company is known for its software suite called "Office", which includes applications such as a text editor, a spreadsheet, and a presentation program.
+                Assistant: 0.8
+
+                # Fact
+                Question: {fact.question}
+                Answer: {fact.answer}
+                Context: {fact.context}
+                """
+            )
+            fact_scores.append(score if score is not None else 0.0)
+        
+        # Filter facts
+        kept_facts = []
+        for i, fact_score in enumerate(fact_scores):
+            if fact_score >= CONFIG.fact_score_threshold:
+                kept_facts.append(fact_model.facts[i])
+        
+        if not kept_facts:
+            logger.info(f"No facts passed quality threshold, skipping: {fact_path}")
+            return
+            
+        logger.info(f"Filtered to {len(kept_facts)}/{initial_fact_count} facts: {fact_path}")
+        
+        # Update model with filtered facts
+        fact_model.facts = kept_facts
+        
+        # Save filtered facts in the selected format(s)
+        critic_base_path = self.config.output_dir / CRITIC_FOLDER / f"{fact_model.file_md5}-{fact_model.chunk_number}-{fact_model.page_number}"
+        save_with_format(asdict(fact_model), critic_base_path, CONFIG.critic_output_format)
+        
+        # Convert to standard .json path for backwards compatibility
+        critic_path = critic_base_path.with_suffix(".json")
+            
+        # Continue to final step
+        await self.index_facts(critic_path, fact_model)
+    
+    async def index_facts(self, critic_path: Path, fact_model: FactedDocumentModel) -> None:
+        """Index facts for retrieval."""
+        # Create indexed models
+        indexed_models = []
+        
+        for i, fact in enumerate(fact_model.facts):
+            # Create a reproducible ID for the fact
+            fact_id = hash_text(
+                f"{fact_model.file_md5}-{fact_model.chunk_number}-{fact_model.page_number}-{i}"
+            )
+            
+            # Create indexed model
+            indexed_model = IndexedDocumentModel(
+                answer=fact.answer,
+                context=fact.context,
+                document_synthesis=fact_model.synthesis,
+                file_path=fact_model.file_path,
+                id=fact_id,
+                question=fact.question
+            )
+            
+            indexed_models.append(indexed_model)
+        
+        # Index models
+        await self.index_client.index(indexed_models)
+        logger.info(f"Indexed {len(indexed_models)} facts from: {critic_path}")
+
+# ========== Main Function ==========
+
+async def main():
+    """Main function."""
+    # Load environment variables from .env file if available
+    if HAS_DOTENV:
+        # Try to load from .env in current directory
+        env_path = Path(".env")
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path)
+            logger.info(f"Loaded environment variables from {env_path.absolute()}")
+        else:
+            # Try to load from default locations
+            load_dotenv()
+            logger.info("Loaded environment variables from default locations")
+    
+    # Check for LiteLLM proxy settings in environment variables
+    proxy_url = os.environ.get("LITELLM_PROXY_URL")
+    if proxy_url and not CONFIG.litellm_proxy_url:
+        CONFIG.litellm_proxy_url = proxy_url
+        logger.info(f"Found LiteLLM proxy URL in environment variables: {proxy_url}")
+    
+    parser = argparse.ArgumentParser(description="Synthetic RAG Lite")
+    
+    # Input/Output configuration
+    io_group = parser.add_argument_group("Input/Output Configuration")
+    io_group.add_argument(
+        "--input", "-i", type=str, default="input",
+        help="Input directory containing markdown files and images"
+    )
+    io_group.add_argument(
+        "--output", "-o", type=str, default="output",
+        help="Output directory for processed files"
+    )
+    io_group.add_argument(
+        "--env-file", type=str,
+        help="Path to .env file containing environment variables (will override default .env)"
+    )
+    
+    # LLM Provider configuration
+    llm_group = parser.add_argument_group("LLM Provider Configuration")
+    llm_group.add_argument(
+        "--llm", type=str, 
+        choices=[p.value for p in LLMProvider], 
+        default="openai",
+        help="LLM provider to use"
+    )
+    llm_group.add_argument(
+        "--model-fast", type=str, default="gpt-4o-mini",
+        help="Fast LLM model name for routine tasks"
+    )
+    llm_group.add_argument(
+        "--model-quality", type=str, default="gpt-4o",
+        help="High quality LLM model name for synthesis and critique"
+    )
+    
+    # Azure OpenAI
+    azure_group = parser.add_argument_group("Azure OpenAI Configuration")
+    azure_group.add_argument(
+        "--azure-api-base", type=str,
+        help="Azure OpenAI API base URL (required for Azure provider)"
+    )
+    azure_group.add_argument(
+        "--azure-api-version", type=str, default="2023-07-01-preview",
+        help="Azure OpenAI API version"
+    )
+    azure_group.add_argument(
+        "--azure-deployment", type=str,
+        help="Azure OpenAI deployment name"
+    )
+    
+    # Ollama configuration
+    ollama_group = parser.add_argument_group("Ollama Configuration")
+    ollama_group.add_argument(
+        "--ollama-model", type=str, default="llama3",
+        help="Ollama model name (if using Ollama provider)"
+    )
+    ollama_group.add_argument(
+        "--ollama-url", type=str, default="http://localhost:11434",
+        help="Ollama API base URL"
+    )
+    
+    # LiteLLM configuration
+    litellm_group = parser.add_argument_group("LiteLLM Configuration")
+    litellm_group.add_argument(
+        "--litellm-proxy", type=str,
+        help="LiteLLM proxy URL for model routing"
+    )
+    litellm_group.add_argument(
+        "--litellm-proxy-key", type=str,
+        help="API key for authenticating with the LiteLLM proxy"
+    )
+    litellm_group.add_argument(
+        "--use-fallbacks", action="store_true",
+        help="Enable model fallbacks in case of errors"
+    )
+    litellm_group.add_argument(
+        "--fallback-models", type=str, nargs="+",
+        help="List of fallback models to try if primary model fails"
+    )
+    
+    # Output Format configuration
+    format_group = parser.add_argument_group("Output Format Configuration")
+    format_group.add_argument(
+        "--fact-format", type=str,
+        choices=[format.value for format in OutputFormat],
+        default=OutputFormat.JSON.value,
+        help="Output format for fact stage (json, jsonl, markdown, or all)"
+    )
+    format_group.add_argument(
+        "--critic-format", type=str,
+        choices=[format.value for format in OutputFormat],
+        default=OutputFormat.JSON.value,
+        help="Output format for critic stage (json, jsonl, markdown, or all)"
+    )
+    format_group.add_argument(
+        "--index-format", type=str,
+        choices=[format.value for format in OutputFormat],
+        default=OutputFormat.JSON.value,
+        help="Output format for index stage (json, jsonl, markdown, or all)"
+    )
+    
+    args = parser.parse_args()
+    
+    # If custom .env file is specified, load it
+    if HAS_DOTENV and args.env_file:
+        env_path = Path(args.env_file)
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path, override=True)
+            logger.info(f"Loaded environment variables from {env_path.absolute()}")
+        else:
+            logger.warning(f"Specified .env file not found: {env_path}")
+    
+    # Configure
+    CONFIG.input_dir = Path(args.input)
+    CONFIG.output_dir = Path(args.output)
+    CONFIG.llm_provider = LLMProvider(args.llm)
+    CONFIG.llm_model_fast = args.model_fast
+    CONFIG.llm_model_quality = args.model_quality
+    
+    # Provider-specific configurations
+    if args.azure_api_base:
+        CONFIG.azure_api_base = args.azure_api_base
+        CONFIG.azure_api_version = args.azure_api_version
+    
+    if args.azure_deployment:
+        CONFIG.azure_deployment_name = args.azure_deployment
+    
+    # Ollama configuration
+    CONFIG.ollama_model = args.ollama_model
+    CONFIG.ollama_base_url = args.ollama_url
+    
+    # LiteLLM configuration
+    if args.litellm_proxy:
+        CONFIG.litellm_proxy_url = args.litellm_proxy
+    
+    if args.litellm_proxy_key:
+        CONFIG.litellm_proxy_key = args.litellm_proxy_key
+    
+    # Fallbacks configuration
+    if args.use_fallbacks:
+        CONFIG.use_fallbacks = True
+        if args.fallback_models:
+            CONFIG.fallback_models = args.fallback_models
+            
+    # Output format configuration
+    CONFIG.fact_output_format = OutputFormat(args.fact_format)
+    CONFIG.critic_output_format = OutputFormat(args.critic_format)
+    CONFIG.index_output_format = OutputFormat(args.index_format)
+    
+    logger.info(f"Synthetic RAG Lite v{CONFIG.version}")
+    logger.info(f"Using LLM provider: {CONFIG.llm_provider.value}")
+    
+    # Ensure input directory exists
+    if not CONFIG.input_dir.exists():
+        logger.error(f"Input directory does not exist: {CONFIG.input_dir}")
+        return
+    
+    # Create pipeline
+    pipeline = ProcessingPipeline(CONFIG)
+    
+    # Find all compatible files
+    compatible_formats = DocumentProcessor.compatible_formats()
+    files_to_process = []
+    
+    for file_path in CONFIG.input_dir.glob("**/*"):
+        if file_path.is_file() and file_path.suffix.lower() in compatible_formats:
+            files_to_process.append(file_path)
+    
+    logger.info(f"Found {len(files_to_process)} compatible files to process")
+    
+    # Process files
+    for file_path in files_to_process:
+        await pipeline.process_file(file_path)
+    
+    logger.info("Processing complete")
+
+if __name__ == "__main__":
+    asyncio.run(main())

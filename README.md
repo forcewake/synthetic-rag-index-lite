@@ -1,352 +1,353 @@
-# 🧠 Synthetic RAG Index
+# Synthetic RAG Lite
 
-Service to import data from various sources (e.g. PDF, images, Microsoft Office, HTML) and index it in AI Search. Increases data relevance and reduces final size by 90%+. Useful for RAG scenarios with LLM. Hosted in Azure with serverless architecture.
+A streamlined tool for synthesizing content from markdown files and images into high-quality indexed facts for retrieval-augmented generation (RAG) systems.
 
-<!-- github.com badges -->
-[![Last release date](https://img.shields.io/github/release-date/clemlesne/synthetic-rag-index)](https://github.com/clemlesne/synthetic-rag-index/releases)
-[![Project license](https://img.shields.io/github/license/clemlesne/synthetic-rag-index)](https://github.com/clemlesne/synthetic-rag-index/blob/main/LICENSE)
+**Purpose**
 
-<!-- GitHub Codespaces badge -->
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/microsoft/synthetic-rag-index?quickstart=1)
+This project aims to provide a lightweight alternative to Microsoft's [Synthetic RAG Index](https://github.com/microsoft/synthetic-rag-index), focusing on simplicity and efficiency for users who require core functionalities without the overhead of a full-scale system.
 
-## Overview
+**Key Differences from Synthetic RAG Index**
 
-In a real-world scenario, with a public corpus of 15M characters (222 PDF, 7.330 pages), 2.940 facts were generated (8.41 MB indexed). That's a 93% reduction in document amount compared to the chunck method (48.111 chuncks, 300 characters each).
+- **Simplified Processing Pipeline**: While the original project offers a comprehensive multi-stage pipeline, Synthetic RAG Lite condenses this into essential steps to streamline content synthesis.
 
-It includes principles taken from research papers:
+- **Broader LLM Provider Support**: Leveraging LiteLLM, this tool supports various LLM providers, including OpenAI, Azure OpenAI, Anthropic, Cohere, Ollama, Together.ai, Google VertexAI, AWS Bedrock, and custom providers via LiteLLM proxy.
 
-1. Repetition removal (<https://arxiv.org/abs/2112.11446>)
-2. Corpus cleaning (<https://arxiv.org/abs/1910.10683>)
-3. Synthetic data generation (<https://huggingface.co/spaces/HuggingFaceFW/blogpost-fineweb-v1>)
+- **Flexible Output Formats**: Users can choose from multiple output formats - JSON, JSONL, Markdown, or all simultaneously - to suit different integration needs.
 
-Funcional workflow is as follows:
+- **Optional Image Processing**: Incorporates OCR capabilities for image files, allowing for text extraction from images when needed.
 
-```mermaid
+**Improvements and Additions**
+
+- **Enhanced LLM Integration**: By utilizing LiteLLM, the tool offers advanced features such as model fallbacks, load balancing, and caching, ensuring reliability and performance.
+
+- **User-Friendly Configuration**: Simplified setup with clear command-line options and environment variable configurations, making it accessible even for users with limited technical expertise.
+
+- **Modular Design**: The codebase is structured for easy maintenance and scalability, allowing for future enhancements and customizations.
+
+**Why a Lite Version?**
+
+The motivation behind creating Synthetic RAG Lite was to offer a more accessible and efficient solution for users who need the core functionalities of content synthesis and indexing without the complexity and resource requirements of the full Synthetic RAG Index system. This lite version caters to projects with limited resources or those seeking a straightforward implementation.
+
+**Acknowledgment**
+
+This project is inspired by and builds upon the foundational work of Microsoft's [Synthetic RAG Index](https://github.com/microsoft/synthetic-rag-index). I extend our gratitude to the original developers for their contributions to the field.
+
 ---
-title: Workflow
----
-graph LR
-  raw[("Raw")]
-  sanitize["Sanitize"]
-  extract["Extract"]
-  chunck["Chunck"]
-  synthesis["Synthetisis"]
-  page["Page"]
-  fact["Fact"]
-  critic["Critic"]
-  index[("Index")]
 
-  raw --> sanitize
-  sanitize --> extract
-  extract --> chunck
-  chunck --> synthesis
-  chunck --> synthesis
-  synthesis --> page
-  page --> fact
-  page --> fact
-  fact --> critic
-  critic --> index
-  critic --> index
-```
+## Features
 
-### Features
+- Process markdown files (.md) and plain text (.txt)
+- Optional image processing with OCR for .jpg, .jpeg, .png, .gif, .bmp (requires PIL and pytesseract)
+- Multi-stage processing pipeline:
+  1. Extract content from files
+  2. Chunk content into manageable pieces
+  3. Synthesize chunks into concise summaries
+  4. Generate question-answer pairs (facts) from content
+  5. Score and filter facts for quality
+  6. Index facts for retrieval
+- Support for multiple LLM providers via LiteLLM:
+  - OpenAI
+  - Azure OpenAI
+  - Anthropic
+  - Cohere
+  - Ollama (local LLM)
+  - Together.ai
+  - Google VertexAI
+  - AWS Bedrock
+  - Custom providers via LiteLLM proxy
+- Advanced LiteLLM features:
+  - Model fallbacks for reliability
+  - Load balancing (via LiteLLM proxy)
+  - Caching (via LiteLLM proxy)
+- Multiple output formats:
+  - JSON (pretty-printed, default)
+  - JSONL (JSON Lines)
+  - Markdown (human-readable)
+  - All formats simultaneously
 
-> [!NOTE]
-> This project is a proof of concept. It is not intended to be used in production. This demonstrates how can be combined Azure serverless technologies and LLM to a high quality search engine for RAG scenarios.
+## Installation
 
-- [x] Cost anything when not used thanks to serverless architecture
-- [x] Data can be searched with semantic queries using AI Search
-- [x] Deduplicate content
-- [x] Extract text from PDF, images, Microsoft Office, HTML
-- [x] Garbage data detection
-- [x] Index files from more than 1000 pages
-- [x] Remove redundant and irrelevant content by synthesis data generation
+1. Clone this repository:
 
-### Format support
+   ```
+   git clone https://github.com/yourusername/synthetic-rag-lite.git
+   cd synthetic-rag-lite
+   ```
 
-Document extraction is based on Azure Document Intelligence, specifically on the `prebuilt-layout` model. It [supports popular formats](https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/concept-layout?view=doc-intel-4.0.0&tabs=sample-code#input-requirements).
+   > **Note**: For backward compatibility, a symbolic link named `local_rag.py` points to `synthetic_rag_lite.py`. Both filenames will work, but we recommend using `synthetic_rag_lite.py` in new scripts.
 
-Some formats are first converted to PDF [with MuPDF](https://github.com/ArtifexSoftware/mupdf) to ensure compatibility with Document Intelligence.
+2. Create a virtual environment and install dependencies:
 
-> [!IMPORTANT]
-> Formats not listed there are treated as binary and decoded with `UTF-8` encoding.
+   ```
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
 
-| `Format` | **OCR** | **Details** |
-|-|-|-|
-| `.bmp` | ✅ | |
-| `.cbz` | ✅ | First converted to PDF with MuPDF. |
-| `.docx` | ✅ | |
-| `.epub` | ✅ | First converted to PDF with MuPDF. |
-| `.fb2` | ✅ | First converted to PDF with MuPDF. |
-| `.heif` | ✅ | |
-| `.html` | ✅ | |
-| `.jpg`, `.jpeg` | ✅ | |
-| `.mobi` | ✅ | First converted to PDF with MuPDF. |
-| `.pdf` | ✅ | Sanitized & compressed with MuPDF. |
-| `.png` | ✅ | |
-| `.pptx` | ✅ | |
-| `.svg` | ✅ | First converted to PDF with MuPDF. |
-| `.tiff` | ✅ | |
-| `.xlsx` | ✅ | |
-| `.xps` | ✅ | First converted to PDF with MuPDF. |
+3. For image processing support (optional):
 
-### Demo
+   ```
+   pip install pillow pytesseract
+   ```
 
-As an example, we take the [code_des_assurances_2024_1.pdf](examples/raw/code_des_assurances_2024_1.pdf) file.
+   You'll also need to install Tesseract OCR:
+   - On macOS: `brew install tesseract`
+   - On Ubuntu/Debian: `apt-get install tesseract-ocr`
+   - On Windows: Download and install from [GitHub](https://github.com/UB-Mannheim/tesseract/wiki)
 
-First, data is extracted from its binary format:
+## Usage
 
-```json
-{
-  "created_at": "2024-06-08T19:17:51.229972Z",
-  "document_content": "Code des assurances\n===\n\ndroit. org Institut Français d'Information Juridique\n\nDernière modification: 2024-01-01 Edition : 2024-01-19 2347 articles avec 5806 liens 57 références externes\n\nCe code ne contient que du droit positif français, les articles et éléments abrogés ne sont pas inclus. Il est recalculé au fur et à mesure des mises à jour. Pensez à actualiser votre copie régulièrement à partir de codes.droit.org.\n\nCes codes ont pour objectif de démontrer l'utilité de l'ouverture des données publiques juridiques tant législatives que jurisprudentielles. Il s'y ajoute une promotion du mouvement Open Science Juridique avec une incitation au dépôt du texte intégral en accès ouvert des articles de doctrine venant du monde professionnel (Grande Bibliothèque du Droit) et universitaire (HAL-CNRS).\n\nTraitements effectués à partir des données issues des APIs Legifrance et Judilibre. droit.org remercie les acteurs du Web qui autorisent des liens vers leur production : Dictionnaire du Droit Privé (réalisé par MM. Serge Braudo et Alexis Baumann), le Conseil constitutionnel, l'Assemblée Nationale, et le Sénat. [...]",
-  "file_path": "raw/code_des_assurances_2024_1.pdf",
-  "format": "markdown",
-  "langs": ["es", "la", "fr", "ja", "en", "it", "pt", "no"],
-  "title": "Code des assurances\n==="
-}
-```
+1. Create input and output directories:
 
-Second, document is paged, and each page is synthesized to keep track of the context during all steps:
+   ```
+   mkdir -p input output
+   ```
 
-```json
-{
-  "synthesis": "The \"Code des assurances\" is structured into several legislative parts and chapters, each dealing with various aspects of insurance law and regulations in France. It covers a wide range of insurance-related subjects including the operation of insurance and reinsurance contracts, the requirements for companies, the obligations of insurers and insured, and the legal framework governing insurance practices. The document includes regulations about the constitution and operation of insurance entities, rules for granting administrative approvals, conditions for opening branches and operating under free provision of services, among others.\n\nSpecifically, it addresses the following:\n1. The legislative basis for insurance contracts.\n2. Detailed provisions on maritime, aerial, and space liability insurances.\n3. Obligations for reporting and transparency in insurance practices.\n4. Rules for life insurance and capitalizations applicable in specific French regions and territories.\n5. Provisions for mandatory insurance types, like vehicle insurance, residence insurance, and insurance of construction work.\n6. Specific rules and exceptions for departments like Bas-Rhin, Haut-Rhin, and Moselle and applicability in French overseas territories. [...]"
-}
+2. Place your markdown files and/or images in the input directory.
+
+3. Run the tool:
+
+   ```
+   python synthetic_rag_lite.py --input input --output output
+   ```
+
+### Command-line Options
 
 ```
+usage: synthetic_rag_lite.py [-h]
+                    [--input INPUT] [--output OUTPUT]
+                    [--llm {openai,azure,anthropic,cohere,ollama,together,vertex,bedrock,custom}]
+                    [--model-fast MODEL_FAST] [--model-quality MODEL_QUALITY]
+                    [--azure-api-base AZURE_API_BASE]
+                    [--azure-api-version AZURE_API_VERSION]
+                    [--azure-deployment AZURE_DEPLOYMENT]
+                    [--ollama-model OLLAMA_MODEL] [--ollama-url OLLAMA_URL]
+                    [--litellm-proxy LITELLM_PROXY] [--use-fallbacks]
+                    [--fallback-models FALLBACK_MODELS [FALLBACK_MODELS ...]]
+                    [--fact-format {json,jsonl,markdown,all}]
+                    [--critic-format {json,jsonl,markdown,all}]
+                    [--index-format {json,jsonl,markdown,all}]
 
-Third, multiple facts (=Q&A pairs) are generated, and those are critiqued to keep only the most relevant ones:
+Synthetic RAG Lite
 
-```json
-{
-  "facts": [
-    {
-      "answer": "The 'Code des assurances' only contains active French law; abrogated articles and elements are not included.",
-      "context": "This exclusion ensures that the code remains up-to-date and relevant, reflecting the current legal landscape without outdated information.",
-      "question": "What elements are excluded from the 'Code des assurances'?"
-    },
-    {
-      "answer": "Insurance can be contracted for the policyholder, for another specified person, or for whomever it may concern.",
-      "context": "This flexibility allows insurance policies to be tailored to various scenarios, ensuring broad applicability and relevance to different stakeholders.",
-      "question": "For whom can insurance be contracted according to the document?"
-    }
-  ]
-}
+options:
+  -h, --help            show this help message and exit
 
+Input/Output Configuration:
+  --input INPUT, -i INPUT
+                        Input directory containing markdown files and images
+  --output OUTPUT, -o OUTPUT
+                        Output directory for processed files
+
+LLM Provider Configuration:
+  --llm {openai,azure,anthropic,cohere,ollama,together,vertex,bedrock,custom}
+                        LLM provider to use
+  --model-fast MODEL_FAST
+                        Fast LLM model name for routine tasks
+  --model-quality MODEL_QUALITY
+                        High quality LLM model name for synthesis and critique
+
+Azure OpenAI Configuration:
+  --azure-api-base AZURE_API_BASE
+                        Azure OpenAI API base URL (required for Azure provider)
+  --azure-api-version AZURE_API_VERSION
+                        Azure OpenAI API version
+  --azure-deployment AZURE_DEPLOYMENT
+                        Azure OpenAI deployment name
+
+Ollama Configuration:
+  --ollama-model OLLAMA_MODEL
+                        Ollama model name (if using Ollama provider)
+  --ollama-url OLLAMA_URL
+                        Ollama API base URL
+
+LiteLLM Configuration:
+  --litellm-proxy LITELLM_PROXY
+                        LiteLLM proxy URL for model routing
+  --litellm-proxy-key LITELLM_PROXY_KEY
+                        API key for authenticating with the LiteLLM proxy
+  --use-fallbacks       Enable model fallbacks in case of errors
+  --fallback-models FALLBACK_MODELS [FALLBACK_MODELS ...]
+                        List of fallback models to try if primary model fails
+
+Output Format Configuration:
+  --fact-format {json,jsonl,markdown,all}
+                        Output format for fact stage (default: json)
+  --critic-format {json,jsonl,markdown,all}
+                        Output format for critic stage (default: json)
+  --index-format {json,jsonl,markdown,all}
+                        Output format for index stage (default: json)
 ```
 
-Finally, facts are individually indexed in AI Search:
+## LLM Configuration with LiteLLM
 
-```json
-{
-  "answer": "The 'Code des assurances' only contains active French law; abrogated articles and elements are not included.",
-  "context": "This exclusion ensures that the code remains up-to-date and relevant, reflecting the current legal landscape without outdated information.",
-  "document_synthesis": "The \"Code des assurances\" is structured into several legislative parts and chapters, each dealing with various aspects of insurance law and regulations in France. It covers a wide range of insurance-related subjects including the operation of insurance and reinsurance contracts, the requirements for companies, the obligations of insurers and insured, and the legal framework governing insurance practices. The document includes regulations about the constitution and operation of insurance entities, rules for granting administrative approvals, conditions for opening branches and operating under free provision of services, among others.\n\nSpecifically, it addresses the following:\n1. The legislative basis for insurance contracts.\n2. Detailed provisions on maritime, aerial, and space liability insurances.\n3. Obligations for reporting and transparency in insurance practices.\n4. Rules for life insurance and capitalizations applicable in specific French regions and territories.\n5. Provisions for mandatory insurance types, like vehicle insurance, residence insurance, and insurance of construction work.\n6. Specific rules and exceptions for departments like Bas-Rhin, Haut-Rhin, and Moselle and applicability in French overseas territories. [...]",
-  "file_path": "raw/code_des_assurances_2024_1.pdf",
-  "id": "93e5846ba121abf6ea3328a7ff5a96b60ab97ce2016166ac0384f2e61a963d6d",
-  "question": "What elements are excluded from the 'Code des assurances'?"
-}
+LiteLLM provides a unified interface to multiple LLM providers, allowing you to easily switch between them or set up fallbacks.
+
+### Setting Environment Variables
+
+You can set environment variables in three ways:
+
+#### 1. Using a .env file (Recommended)
+
+Create a `.env` file in the project directory with your API keys:
+
+```
+# .env file
+OPENAI_API_KEY=your_openai_api_key
+ANTHROPIC_API_KEY=your_anthropic_api_key
 ```
 
-### High level architecture
-
-```mermaid
----
-title: High level process
----
-graph LR
-  importer["Importer"]
-  openai_ada["Ada\n(OpenAI)"]
-  search_index["Index\n(AI Search)"]
-  storage[("Blob\n(Storage Account)")]
-
-  importer -- Pull from --> storage
-  importer -- Push to --> search_index
-  search_index -. Generate embeddings .-> openai_ada
-```
-
-### Component level architecture
-
-```mermaid
----
-title: Importer component diagram (C4 model)
----
-graph LR
-  openai_ada["Ada\n(OpenAI)"]
-  search_index["Index\n(AI Search)"]
-  storage[("Blob\n(Storage Account)")]
-
-  subgraph importer["Importer"]
-    document["Document extraction\n(Document Intelligence)"]
-    openai_gpt["GPT-4o\n(OpenAI)"]
-
-    func_chunck["Chunck\n(Function App)"]
-    func_critic["Critic\n(Function App)"]
-    func_extract["Extracted\n(Function App)"]
-    func_fact["Fact\n(Function App)"]
-    func_index["Index\n(Function App)"]
-    func_page["Page\n(Function App)"]
-    func_sanitize["Sanitize\n(Function App)"]
-    func_synthesis["Synthetisis\n(Function App)"]
-  end
-
-
-  func_sanitize -- Pull from --> storage
-  func_sanitize -- Convert and linearize --> func_sanitize
-  func_sanitize -- Push to --> func_extract
-  func_extract -- Ask for extraction --> document
-  func_extract -. Poll for result .-> document
-  func_extract -- Push to --> func_chunck
-  func_chunck -- Split into large parts --> func_chunck
-  func_chunck -- Push to --> func_synthesis
-  func_synthesis -- Create a chunck synthesis --> openai_gpt
-  func_synthesis -- Push to --> func_page
-  func_page -- Split into small parts --> func_page
-  func_page -- Clean and filter repetitive content --> func_page
-  func_page -- Push to --> func_fact
-  func_fact -- Create Q/A pairs --> openai_gpt
-  func_fact -- Push to --> func_critic
-  func_critic -- Push to --> func_index
-  func_critic -- Create a score for each fact --> openai_gpt
-  func_critic -- Filter out irrelevant facts --> func_critic
-  func_index -- Generate reproductible IDs --> func_index
-  func_index -- Push to --> search_index
-  search_index -. Generate embeddings .-> openai_ada
-```
-
-### Usage cost
-
-From experiments, the cost of indexing a document is around 29.15€ per 1k pages. Here is a detailed breakdown:
-
-Scenario:
-
-- 7.330 pages (15M characters)
-- 222 PDF (550.50 MB)
-- French (90%) and English (10%)
-
-Outcome:
-
-- 2.940 facts generated
-- 8.41 MB indexed on AI Search
-
-Cost:
-
-| Service | Usage | Cost (abs) | Cost (per 1k pages) |
-|-|-|-|-|
-| **Azure AI Search** | Billed per hour | N/A | N/A |
-| **Azure Blob Storage** | N/A | N/A | N/A |
-| **Azure Document Intelligence** | 7.330 pages | 67,79€ | 9.25€ |
-| **Azure Functions** | N/A | N/A | N/A |
-| **Azure OpenAI GPT-4o** (in) | 23.79M tokens | 111,81€ | 15.25€ |
-| **Azure OpenAI GPT-4o** (out) | 2.45M tokens | 34,06€ | 4.65€ |
-| **Total** | | **213,66€** | **29.15€** |
-
-## Local installation
-
-Some prerequisites are needed to deploy the solution.
-
-[Prefer using GitHub Codespaces for a quick start.](https://codespaces.new/microsoft/synthetic-rag-index?quickstart=1) The environment will setup automatically with all the required tools.
-
-In macOS, with [Homebrew](https://brew.sh), simply type `make brew`.
-
-For other systems, make sure you have the following installed:
-
-- Bash compatible shell, like `bash` or `zsh`
-- Make, `apt install make` (Ubuntu), `yum install make` (CentOS), `brew install make` (macOS)
-- [Azure Functions Core Tools](https://github.com/Azure/azure-functions-core-tools?tab=readme-ov-file#installing)
-
-Place a file called `config.yaml` in the root of the project with the following content:
-
-```yaml
-# config.yaml
-llm:
-  fast:
-    mode: azure_openai
-    azure_openai:
-      api_key: xxx
-      context: 16385
-      deployment: gpt-35-turbo-0125
-      endpoint: https://xxx.openai.azure.com
-      model: gpt-35-turbo
-      streaming: true
-  slow:
-    mode: azure_openai
-    azure_openai:
-      api_key: xxx
-      context: 128000
-      deployment: gpt-4o-2024-05-13
-      endpoint: https://xxx.openai.azure.com
-      model: gpt-4o
-      streaming: true
-
-destination:
-  mode: ai_search
-  ai_search:
-    access_key: xxx
-    endpoint: https://xxx.search.windows.net
-    index: trainings
-
-document_intelligence:
-  access_key: xxx
-  endpoint: https://xxx.cognitiveservices.azure.com
-```
-
-To use a Service Principal to authenticate to Azure, you can also add the following in a `.env` file:
-
-```dotenv
-AZURE_CLIENT_ID=xxx
-AZURE_CLIENT_SECRET=xxx
-AZURE_TENANT_ID=xxx
-```
-
-To override a specific configuration value, you can also use environment variables. For example, to override the `llm.fast.azure_openai.endpoint` value, you can use the `LLM__FAST__AZURE_OPENAI__ENDPOINT` variable:
-
-```dotenv
-LLM__FAST__AZURE_OPENAI__ENDPOINT=https://xxx.openai.azure.com
-```
-
-Then run:
+A sample `.env.example` file is provided with the project. Simply copy it to `.env` and fill in your values:
 
 ```bash
-# Install dependencies
-make install
+cp .env.example .env
+# Then edit .env with your favorite editor
 ```
 
-AI Search also requires to be configured with the following index:
-
-| **Field Name** | `Type` | Retrievable | Searchable | Dimensions | Vectorizer |
-|-|-|-|-|-|-|
-| **answer** | `Edm.String` | Yes | Yes | | |
-| **context** | `Edm.String` | Yes | Yes | | |
-| **created_at** | `Edm.String` | Yes | No | | |
-| **document_synthesis** | `Edm.String` | Yes | Yes | | |
-| **file_path** | `Edm.String` | Yes | No | | |
-| **id** | `Edm.String` | Yes | No | | |
-| **question** | `Edm.String` | Yes | Yes | | |
-| **vectors** | `Collection(Edm.Single)` | No | Yes | 1536 | *OpenAI ADA* |
-
-### Run
-
-Finally, run:
+You can also specify a custom env file location:
 
 ```bash
-# Start the local API server
-make dev
+python synthetic_rag_lite.py --env-file /path/to/your/.env
 ```
 
-## Advanced usage
+#### 2. Using environment variables directly
 
-### Configuration
+Set the appropriate API keys for your chosen provider in your shell:
 
-Features are documented in [features.py](helpers/config_models/features.py). The features can all be overridden in `config.yaml` file:
+```bash
+# For OpenAI
+export OPENAI_API_KEY=your_openai_key
 
-```yaml
-# config.yaml
-features:
-  fact_iterations: 10
-  fact_score_threshold: 0.5
-  page_split_size: 2000
+# For Azure OpenAI
+export AZURE_API_KEY=your_azure_key
 
-[...]
+# For Anthropic
+export ANTHROPIC_API_KEY=your_anthropic_key
+
+# For Cohere
+export COHERE_API_KEY=your_cohere_key
+
+# For Google VertexAI
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+# For AWS Bedrock
+export AWS_ACCESS_KEY_ID=your_aws_access_key_id
+export AWS_SECRET_ACCESS_KEY=your_aws_secret_access_key
 ```
+
+### Example Provider Configurations
+
+#### Using OpenAI
+
+```bash
+python synthetic_rag_lite.py --llm openai --model-fast gpt-4o-mini --model-quality gpt-4o
+```
+
+#### Using Azure OpenAI
+
+```bash
+python synthetic_rag_lite.py --llm azure --azure-api-base "https://your-resource.openai.azure.com" --azure-deployment your-deployment-name
+```
+
+#### Using Anthropic
+
+```bash
+python synthetic_rag_lite.py --llm anthropic --model-fast claude-3-haiku-20240307 --model-quality claude-3-opus-20240229
+```
+
+#### Using Ollama (Local LLM)
+
+```bash
+python synthetic_rag_lite.py --llm ollama --ollama-model llama3 --ollama-url "http://localhost:11434"
+```
+
+### Advanced Features
+
+#### Using Model Fallbacks
+
+Enable fallbacks to automatically try alternative models if the primary model fails:
+
+```bash
+python synthetic_rag_lite.py --llm openai --model-fast gpt-4o-mini --model-quality gpt-4o --use-fallbacks --fallback-models anthropic/claude-3-haiku-20240307 ollama/llama3
+```
+
+#### Using Multiple Output Formats
+
+Choose different output formats for each processing stage:
+
+```bash
+python synthetic_rag_lite.py --input input --output output --fact-format all --critic-format markdown --index-format jsonl
+```
+
+Available formats are:
+
+- `json`: Standard pretty-printed JSON (default)
+- `jsonl`: JSON Lines format (one JSON object per line)
+- `markdown`: Human-readable Markdown
+- `all`: Generate all formats simultaneously
+
+#### Using LiteLLM Proxy
+
+If you're running a LiteLLM proxy for load balancing or custom routing:
+
+```bash
+python synthetic_rag_lite.py --litellm-proxy "http://localhost:8000"
+```
+
+If your LiteLLM proxy requires authentication (separate from the underlying provider):
+
+```bash
+python synthetic_rag_lite.py --litellm-proxy "http://localhost:8000" --litellm-proxy-key "your-proxy-api-key"
+```
+
+You can also set these in your .env file:
+
+```
+LITELLM_PROXY_URL=http://localhost:8000
+LITELLM_PROXY_KEY=your-proxy-api-key
+```
+
+### Repetition Detection
+
+The tool automatically filters out content with excessive repetition. You can adjust the sensitivity of this detection:
+
+```bash
+# In your .env file or environment
+REPETITION_THRESHOLD=2.0  # Higher values are more permissive (default: 2.0)
+```
+
+This threshold determines how much repetition is allowed in the content:
+
+- Values below 1.0 are very strict
+- Default value is 2.0
+- Higher values allow more repetition
+- Set to 0 to disable repetition detection
+
+## Output Structure
+
+The tool creates a structured output directory:
+
+```
+output/
+├── 0-sanitize/          # Sanitized input files
+├── 1-extract/           # Extracted text content
+├── 2-chunck/            # Content split into chunks
+├── 3-synthesis/         # Synthesized chunk summaries
+├── 4-page/              # Content split into pages
+├── 5-fact/              # Generated facts
+├── 6-critic/            # Quality-filtered facts
+└── 7-index/             # Indexed facts for retrieval
+```
+
+The final output in the `7-index` directory contains files with question-answer pairs derived from your content, ready for use in retrieval systems. Depending on the output format(s) selected, these could be JSON (*.json), JSON Lines (*.jsonl), or Markdown (*.md) files.
+
+The query tool automatically loads both JSON and JSONL formats when searching for facts. If you need to work with multiple output formats, remember to specify the appropriate format in your data loading code.
+
+## Requirements
+
+- Python 3.8+
+- OpenAI or Ollama
+- For image processing:
+  - Pillow
+  - pytesseract
+  - Tesseract OCR
