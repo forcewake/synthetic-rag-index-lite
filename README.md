@@ -70,12 +70,10 @@ This project is inspired by and builds upon the foundational work of Microsoft's
 1. Clone this repository:
 
    ```
-   git clone https://github.com/yourusername/synthetic-rag-lite.git
+   git clone https://github.com/forcewake/synthetic-rag-lite.git
    cd synthetic-rag-lite
    ```
-
-   > **Note**: For backward compatibility, a symbolic link named `local_rag.py` points to `synthetic_rag_lite.py`. Both filenames will work, but we recommend using `synthetic_rag_lite.py` in new scripts.
-
+   
 2. Create a virtual environment and install dependencies:
 
    ```
